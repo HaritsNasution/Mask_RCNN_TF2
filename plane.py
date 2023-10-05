@@ -187,8 +187,7 @@ def inference(model, image_path=None):
     image = skimage.io.imread(args.image)
     # Detect objects
     r = model.detect([image], verbose=1)[0]
-    # Color splash
-    r = r[0]
+    
     visualize.display_instances(image, r['rois'], r['masks'], r['class_ids'],
                             class_names, r['scores'])
     # Save output
