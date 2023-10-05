@@ -127,7 +127,7 @@ class PlaneDataset(utils.Dataset):
             one mask per instance.
         class_ids: a 1D array of class IDs of the instance masks.
         """
-        # If not a balloon dataset image, delegate to parent class.
+        # If not a plane dataset image, delegate to parent class.
         image_info = self.image_info[image_id]
         if image_info["source"] != "plane":
             return super(self.__class__, self).load_mask(image_id)
@@ -159,12 +159,12 @@ def train(model):
     """Train the model."""
     # Training dataset.
     dataset_train = PlaneDataset()
-    dataset_train.load_balloon(args.dataset, "train")
+    dataset_train.load_plane(args.dataset, "train")
     dataset_train.prepare()
 
     # Validation dataset
     dataset_val = PlaneDataset()
-    dataset_val.load_balloon(args.dataset, "val")
+    dataset_val.load_plane(args.dataset, "val")
     dataset_val.prepare()
 
     # *** This training schedule is an example. Update to your needs ***
@@ -207,13 +207,13 @@ if __name__ == '__main__':
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description='Train Mask R-CNN to detect balloons.')
+        description='Train Mask R-CNN to detect planes.')
     parser.add_argument("command",
                         metavar="<command>",
                         help="'train' or 'inference'")
     parser.add_argument('--dataset', required=False,
-                        metavar="/path/to/balloon/dataset/",
-                        help='Directory of the Balloon dataset')
+                        metavar="/path/to/plane/dataset/",
+                        help='Directory of the Plane dataset')
     parser.add_argument('--weights', required=True,
                         metavar="/path/to/weights.h5",
                         help="Path to weights .h5 file or 'coco'")
