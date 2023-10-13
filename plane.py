@@ -3,6 +3,8 @@ import sys
 import json
 import datetime
 import numpy as np
+import imgaug as ia
+import imgaug.augmenters as iaa
 import skimage.draw
 import matplotlib.pyplot as plt
 
@@ -38,7 +40,7 @@ class PlaneConfig(Config):
 
     # We use a GPU with 12GB memory, which can fit two images.
     # Adjust down if you use a smaller GPU.
-    IMAGES_PER_GPU = 2
+    IMAGES_PER_GPU = 1
 
     # Number of classes (including background)
     NUM_CLASSES = 1 + 5  # Background + pesawat, ekor, pintu, sayap, mesin
@@ -103,8 +105,12 @@ class PlaneDataset(utils.Dataset):
             # The if condition is needed to support VIA versions 1.x and 2.x.
             if type(a['regions']) is dict:
                 polygons = [r['shape_attributes'] for r in a['regions'].values()]
+                objects = [s['region_attributes']['label'] for s in a['regions'].values()]
             else:
-                polygons = [r['shape_attributes'] for r in a['regions']] 
+                polygons = [r['shape_attributes'] for r in a['regions']]
+                objects = [s['region_attributes']['label'] for s in a['regions']]
+            name_dict = {"pesawat":1,"ekor":2,"pintu":3,"sayap":4,"mesin":5}
+            num_ids = [name_dict[a] for a in objects]
 
             # load_mask() needs the image size to convert polygons to masks.
             # Unfortunately, VIA doesn't include it in JSON, so we must read
@@ -118,7 +124,8 @@ class PlaneDataset(utils.Dataset):
                 image_id=a['filename'],  # use file name as a unique image id
                 path=image_path,
                 width=width, height=height,
-                polygons=polygons)
+                polygons=polygons,
+                num_ids=num_ids)
 
     def load_mask(self, image_id):
         """Generate instance masks for an image.
@@ -135,7 +142,10 @@ class PlaneDataset(utils.Dataset):
         # Convert polygons to a bitmap mask of shape
         # [height, width, instance_count]
         info = self.image_info[image_id]
-        mask = np.zeros([info["height"]+1, info["width"]+1, len(info["polygons"])],
+        if info["source"] != "plane":
+            return super(self.__class__, self).load_mask(image_id)
+        num_ids = info["num_ids"]
+        mask = np.zeros([info["height"], info["width"], len(info["polygons"])],
                         dtype=np.uint8)
         for i, p in enumerate(info["polygons"]):
             # Get indexes of pixels inside the polygon and set them to 1
@@ -144,7 +154,8 @@ class PlaneDataset(utils.Dataset):
 
         # Return mask, and array of class IDs of each instance. Since we have
         # one class ID only, we return an array of 1s
-        return mask.astype(bool), np.ones([mask.shape[-1]], dtype=np.int32)
+        num_ids = np.array(num_ids, dtype=np.int32)
+        return mask, num_ids
 
     def image_reference(self, image_id):
         """Return the path of the image."""
@@ -167,6 +178,79 @@ def train(model):
     dataset_val.load_plane(args.dataset, "val")
     dataset_val.prepare()
 
+    # Augmentations
+    # Sometimes(0.5, ...) applies the given augmenter in 50% of all cases,
+    # e.g. Sometimes(0.5, GaussianBlur(0.3)) would blur roughly every second image.
+    sometimes = lambda aug: iaa.Sometimes(0.5, aug)
+
+    seq = iaa.Sequential(
+    [
+            # apply the following augmenters to most images
+            iaa.Fliplr(0.5), # horizontally flip 50% of all images
+            iaa.Flipud(0.2), # vertically flip 20% of all images
+            # crop images by -5% to 10% of their height/width
+            sometimes(iaa.CropAndPad(
+                percent=(-0.05, 0.1),
+                pad_mode=ia.ALL,
+                pad_cval=(0, 255)
+            )),
+            sometimes(iaa.Affine(
+                scale={"x": (0.8, 1.2), "y": (0.8, 1.2)}, # scale images to 80-120% of their size, individually per axis
+                translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)}, # translate by -20 to +20 percent (per axis)
+                rotate=(-45, 45), # rotate by -45 to +45 degrees
+                shear=(-16, 16), # shear by -16 to +16 degrees
+                order=[0, 1], # use nearest neighbour or bilinear interpolation (fast)
+                cval=(0, 255), # if mode is constant, use a cval between 0 and 255
+                mode=ia.ALL # use any of scikit-image's warping modes (see 2nd image from the top for examples)
+            )),
+            # execute 0 to 5 of the following (less important) augmenters per image
+            # don't execute all of them, as that would often be way too strong
+            iaa.SomeOf((0, 5),
+                [
+                    sometimes(iaa.Superpixels(p_replace=(0, 1.0), n_segments=(20, 200))), # convert images into their superpixel representation
+                    iaa.OneOf([
+                        iaa.GaussianBlur((0, 3.0)), # blur images with a sigma between 0 and 3.0
+                        iaa.AverageBlur(k=(2, 7)), # blur image using local means with kernel sizes between 2 and 7
+                        iaa.MedianBlur(k=(3, 11)), # blur image using local medians with kernel sizes between 2 and 7
+                    ]),
+                    iaa.Sharpen(alpha=(0, 1.0), lightness=(0.75, 1.5)), # sharpen images
+                    iaa.Emboss(alpha=(0, 1.0), strength=(0, 2.0)), # emboss images
+                    # search either for all edges or for directed edges,
+                    # blend the result with the original image using a blobby mask
+                    iaa.SimplexNoiseAlpha(iaa.OneOf([
+                        iaa.EdgeDetect(alpha=(0.5, 1.0)),
+                        iaa.DirectedEdgeDetect(alpha=(0.5, 1.0), direction=(0.0, 1.0)),
+                    ])),
+                    iaa.AdditiveGaussianNoise(loc=0, scale=(0.0, 0.05*255), per_channel=0.5), # add gaussian noise to images
+                    iaa.OneOf([
+                        iaa.Dropout((0.01, 0.1), per_channel=0.5), # randomly remove up to 10% of the pixels
+                        iaa.CoarseDropout((0.03, 0.15), size_percent=(0.02, 0.05), per_channel=0.2),
+                    ]),
+                    iaa.Invert(0.05, per_channel=True), # invert color channels
+                    iaa.Add((-10, 10), per_channel=0.5), # change brightness of images (by -10 to 10 of original value)
+                    iaa.AddToHueAndSaturation((-20, 20)), # change hue and saturation
+                    # either change the brightness of the whole image (sometimes
+                    # per channel) or change the brightness of subareas
+                    iaa.OneOf([
+                        iaa.Multiply((0.5, 1.5), per_channel=0.5),
+                        iaa.FrequencyNoiseAlpha(
+                            exponent=(-4, 0),
+                            first=iaa.Multiply((0.5, 1.5), per_channel=True),
+                            second=iaa.ContrastNormalization((0.5, 2.0))
+                        )
+                    ]),
+                    iaa.ContrastNormalization((0.5, 2.0), per_channel=0.5), # improve or worsen the contrast
+                    iaa.Grayscale(alpha=(0.0, 1.0)),
+                    sometimes(iaa.ElasticTransformation(alpha=(0.5, 3.5), sigma=0.25)), # move pixels locally around (with random strengths)
+                    sometimes(iaa.PiecewiseAffine(scale=(0.01, 0.05))), # sometimes move parts of the image around
+                    sometimes(iaa.PerspectiveTransform(scale=(0.01, 0.1)))
+                ],
+                random_order=True
+            )
+        ],
+        random_order=True
+    )
+
     # *** This training schedule is an example. Update to your needs ***
     # Since we're using a very small dataset, and starting from
     # COCO trained weights, we don't need to train too long. Also,
@@ -174,7 +258,8 @@ def train(model):
     print("Training network heads")
     model.train(dataset_train, dataset_val,
                 learning_rate=config.LEARNING_RATE,
-                epochs=30,
+                epochs=300,
+                augmentation=seq,
                 layers='heads')
 
 
@@ -191,10 +276,10 @@ def inference(model, image_path=None):
     visualize.display_instances(image, r['rois'], r['masks'], r['class_ids'],
                             class_names, r['scores'])
     # Save output
-    file_name = "detect_{:%Y%m%dT%H%M%S}.png".format(datetime.datetime.now())
-    plt.savefig(file_name,bbox_inches='tight', pad_inches=-0.5,orientation= 'landscape')
+    # file_name = "detect_{:%Y%m%dT%H%M%S}.png".format(datetime.datetime.now())
+    # plt.savefig(file_name,bbox_inches='tight', pad_inches=-0.5,orientation= 'landscape')
 
-    print("Saved to ", file_name)
+    # print("Saved to ", file_name)
 
 
 ############################################################
